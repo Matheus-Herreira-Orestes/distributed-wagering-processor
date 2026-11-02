@@ -2,7 +2,9 @@
 
 ## Current milestone
 
-This repository deliberately implements only the foundation: a Bun/NestJS entry point, a pure `Money` value object, local PostgreSQL/SQS infrastructure, and the schema needed for the next vertical slices. It does **not** yet accept or process wagers.
+The current milestone implements the framework-free `Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction`, `InboxMessage`, `OutboxMessage`, and integration-event models together with `CreateWalletUseCase` and `ProcessBetUseCase`. Wallet creation and BET processing persist through PostgreSQL transactions; BET processing combines a wallet-scoped `SELECT ... FOR UPDATE`, persistent idempotency, and the immutable wallet ledger. SQS BET delivery now uses a persistent inbox, and committed BET outcomes are recorded in the transactional outbox.
+
+WIN, LOSS, REFUND, ROLLBACK, pending-reference processing, HTTP wager endpoints, authentication, metrics, and readiness checks remain deferred.
 
 ## Shape
 
@@ -21,11 +23,27 @@ infrastructure (MikroORM / SQS) --------------------------^ implements ports
 
 PostgreSQL is the authority for balance, idempotency, and ledger invariants. The initial migration establishes database constraints for non-negative balances, unique wallet and transaction identities, ledger arithmetic, and ledger immutability. The wager-processing milestone will use a transaction plus a wallet-scoped PostgreSQL row lock (`FOR UPDATE` via MikroORM) so separate wallets remain parallel without a global lock.
 
-MikroORM is selected for its explicit Unit of Work and transactional `EntityManager`. Future repositories will be adapters for application ports; domain objects will not be MikroORM entities.
+The wallet row is the concurrency unit for financial changes. BET processing locks only its target wallet with `SELECT ... FOR UPDATE`, then reloads the balance and persisted transaction state inside the same SQL transaction. Requests for one wallet serialize around that row, while unrelated wallets retain PostgreSQL's normal parallelism; there is no process-wide lock or in-memory mutex.
+
+PostgreSQL provides the final correctness guarantees. Row locks prevent lost balance updates, unique constraints arbitrate idempotency and provider-transaction races across application instances, and the persisted payload hash distinguishes a replay from an idempotency conflict. Wallet updates, wager transactions, and ledger entries commit or roll back together. Application memory can improve throughput, but it is never authoritative for money or idempotency.
+
+The current persistence adapters use parameterized SQL through MikroORM's transactional `EntityManager` and implement application ports. Domain classes remain independent from MikroORM and have no ORM decorators.
+
+The MikroORM configuration intentionally uses `migrationsList` so TypeScript migrations load reliably when the migration runner executes directly through Bun on Windows. Every future migration must be imported and added explicitly to that list.
 
 ## Messaging
 
-LocalStack provides the two FIFO queues for local development. FIFO is helpful for transport, but never the source of financial correctness. The next messaging milestone will make inbox, financial writes, ledger, and outbox one SQL transaction; an outbox worker will publish only after commit.
+LocalStack provides the wager FIFO queue, its dead-letter queue, and the integration-event FIFO queue for local development. The SQS consumer uses the provider's body-level `messageId`—not the transport-level SQS `MessageId`—as the `(consumer_name, message_id)` inbox identity. It invokes the shared `ProcessBetUseCase`, marks the inbox row processed, and writes transaction, wallet, ledger, and outbox state in one PostgreSQL transaction. A duplicate provider message ID therefore cannot repeat the financial effect.
+
+Malformed contracts and deterministic domain/application failures are terminal. Valid messages that reach such a failure persist their processed inbox outcome before SQS acknowledgment; malformed messages are acknowledged without financial processing. PostgreSQL, SQS, network, timeout, and unexpected failures remain transient: they escape the consumer without acknowledgment so SQS can retry and eventually apply its DLQ policy.
+
+The outbox publisher claims eligible rows with `FOR UPDATE SKIP LOCKED` and persists a worker identity plus an expiring lease. Multiple publishers can work concurrently without claiming the same row. A confirmed SQS send is followed by `published_at`; failed sends increment `attempts`, store the error, and schedule bounded exponential backoff. Rows that reach the configured attempt limit enter a terminal `failed_at` state instead of looping forever.
+
+Every published event uses the versioned `eventId`, `eventType`, `aggregateId`, `correlationId`, optional `causationId`, `occurredAt`, `version`, and `data` envelope. Current BET events use the wager transaction ID as their stable correlation ID and the BET idempotency key as causation ID. Monetary event data contains serialized `MoneyProps`, never domain `Money` objects.
+
+Publication is at-least-once, not exactly-once. A publisher can die after SQS accepts an event but before PostgreSQL records `published_at`; after the lease expires another publisher may send that event again. Every downstream consumer must persistently deduplicate by `eventId`, which is also the FIFO `MessageDeduplicationId`.
+
+FIFO ordering helps reduce avoidable contention and out-of-order delivery, but it is not the financial source of truth. Correctness still holds for retries, duplicate delivery, multiple consumers, and direct concurrent calls because PostgreSQL row locks, constraints, the inbox, persisted BET idempotency, and the immutable ledger remain authoritative.
 
 ## Authentication
 

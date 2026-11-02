@@ -1,4 +1,4 @@
-import Decimal from 'decimal.js';
+import { Decimal } from 'decimal.js';
 import { CurrencyMismatchError, InvalidMoneyError } from './domain-error.js';
 
 export interface MoneyProps {
