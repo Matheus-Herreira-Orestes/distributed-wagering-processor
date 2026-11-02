@@ -1,6 +1,8 @@
 import { Money, type MoneyProps } from '../../shared/domain/money.js';
 import type { ProcessBetResult } from '../../wagering/application/process-bet.use-case.js';
-import { ProcessBetUseCase } from '../../wagering/application/process-bet.use-case.js';
+import type { ProcessBetRepositories } from '../../wagering/application/ports/process-bet.persistence-port.js';
+import type { ProcessWagerTransactionInput, ProcessWagerTransactionResult } from '../../wagering/application/process-wager-transaction.use-case.js';
+import { WagerTransactionKind } from '../../wagering/domain/wager-transaction.js';
 import { InboxMessage } from '../domain/inbox-message.js';
 import type { WagerMessageUnitOfWork } from './ports/process-wager-message.persistence-port.js';
 import { InvalidWagerMessageError } from './process-wager-message-error.js';
@@ -16,8 +18,9 @@ export interface WagerTransactionRequestedData {
   walletId: string;
   roundId: string;
   gameId: string;
-  kind: 'BET';
+  kind: 'BET' | 'WIN' | 'LOSS' | 'REFUND' | 'ROLLBACK';
   money: MoneyProps;
+  referenceExternalTransactionId?: string;
 }
 
 export interface WagerTransactionRequested {
@@ -29,14 +32,21 @@ export interface WagerTransactionRequested {
 
 export interface ProcessWagerMessageResult {
   duplicateMessage: boolean;
-  bet?: ProcessBetResult;
+  bet?: ProcessWagerTransactionResult | ProcessBetResult;
   terminalFailure?: { name: string; message: string };
+}
+
+interface WagerProcessor {
+  executeInTransaction(
+    input: ProcessWagerTransactionInput,
+    repositories: ProcessBetRepositories,
+  ): Promise<ProcessWagerTransactionResult | ProcessBetResult>;
 }
 
 export class ProcessWagerMessageUseCase {
   constructor(
     private readonly unitOfWork: WagerMessageUnitOfWork,
-    private readonly processBet: ProcessBetUseCase,
+    private readonly processBet: WagerProcessor,
     private readonly consumerName = WAGER_BET_CONSUMER,
   ) {}
 
@@ -56,7 +66,7 @@ export class ProcessWagerMessageUseCase {
         return { duplicateMessage: true };
       }
 
-      let result: ProcessBetResult;
+      let result: ProcessWagerTransactionResult | ProcessBetResult;
       try {
         result = await this.processBet.executeInTransaction({
           providerId: request.data.providerId,
@@ -66,7 +76,10 @@ export class ProcessWagerMessageUseCase {
           walletId: request.data.walletId,
           roundId: request.data.roundId,
           gameId: request.data.gameId,
+          kind: request.data.kind as WagerTransactionKind,
           money: Money.from(request.data.money),
+          ...(request.data.referenceExternalTransactionId === undefined
+            ? {} : { referenceExternalTransactionId: request.data.referenceExternalTransactionId }),
         }, context.bet);
       } catch (error) {
         if (!isTerminalWagerConsumerError(error)) throw error;
@@ -103,10 +116,12 @@ export function parseWagerTransactionRequested(body: string): WagerTransactionRe
   if (!isNonEmptyString(value.messageId)
     || !isValidDateString(value.occurredAt)
     || required.some(key => !isNonEmptyString(data[key]))
-    || data.kind !== 'BET'
+    || !Object.values(WagerTransactionKind).includes(data.kind as WagerTransactionKind)
+    || data.kind === WagerTransactionKind.OPENING
     || !isRecord(data.money)
     || typeof data.money.amount !== 'string'
-    || typeof data.money.currency !== 'string') {
+    || typeof data.money.currency !== 'string'
+    || (data.referenceExternalTransactionId !== undefined && !isNonEmptyString(data.referenceExternalTransactionId))) {
     throw new InvalidWagerMessageError('WagerTransactionRequested has invalid fields.');
   }
   return value as unknown as WagerTransactionRequested;

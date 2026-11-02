@@ -258,7 +258,7 @@ export class ProcessBetUseCase {
   }
 
   private result(transaction: WagerTransaction, idempotentReplay: boolean): ProcessBetResult {
-    if (transaction.status === WagerTransactionStatus.PENDING || transaction.resultBalance === null) {
+    if ((transaction.status !== WagerTransactionStatus.PROCESSED && transaction.status !== WagerTransactionStatus.REJECTED) || transaction.resultBalance === null) {
       throw new Error(`Persisted BET transaction ${transaction.id} has no terminal result.`);
     }
 

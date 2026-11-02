@@ -6,17 +6,17 @@ A strict TypeScript modular monolith for reliable wallet and wagering processing
 
 - Framework-free `Money`, `Wallet`, `WalletLedgerEntry`, and `WagerTransaction` domain models
 - Atomic wallet creation, including an opening transaction and credit ledger entry when the initial balance is positive
-- Transaction-safe BET processing with exact decimal money, persisted idempotency, and an immutable ledger
+- Transaction-safe BET, WIN, LOSS, REFUND, and ROLLBACK processing with exact decimal money, persisted idempotency, and an immutable ledger
 - Wallet-scoped PostgreSQL `SELECT ... FOR UPDATE` locking, allowing different wallets to process independently
-- Persistent Inbox deduplication for SQS BET requests
+- Persistent Inbox deduplication for every SQS wager request
 - Transactional Outbox events for processed/rejected wagers and wallet balance changes
 - Concurrent outbox publication using `FOR UPDATE SKIP LOCKED`, expiring claims, retries, and bounded exponential backoff
 - PostgreSQL and LocalStack integration/concurrency tests
-- Minimal NestJS liveness endpoint: `GET /health/live`
+- HTTP wallet, transaction, ledger, reconciliation, liveness, readiness, and metrics endpoints
 
 PostgreSQL is the financial source of truth. SQS FIFO ordering helps transport efficiency but is not relied upon for balance correctness or idempotency.
 
-Not implemented yet: WIN, LOSS, REFUND, ROLLBACK, pending-reference processing, HTTP wallet/wager endpoints, authentication, metrics, and readiness checks.
+Authentication is intentionally left behind an explicit `ProviderIdentityPort` extension point. A production deployment should implement it with an external OIDC provider.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ The local defaults use:
 - LocalStack: `127.0.0.1:4566`
 - NestJS: `127.0.0.1:3000`
 
-`SQS_WAGER_VISIBILITY_TIMEOUT_SECONDS` configures how long received BET messages stay hidden while being processed. It defaults to 30 seconds and should be greater than the expected time to process and acknowledge a polled batch.
+`SQS_WAGER_VISIBILITY_TIMEOUT_SECONDS` configures how long received wager messages stay hidden while being processed. It defaults to 30 seconds and should be greater than the expected time to process and acknowledge a polled batch.
 
 ## Start locally
 
@@ -45,7 +45,7 @@ bun run dev
 
 Open `http://localhost:3000/health/live` to check liveness.
 
-Run the SQS consumer and outbox publisher in a second terminal:
+Run the SQS consumer, outbox publisher, and pending-reference worker in a second terminal:
 
 ```powershell
 bun run workers:messaging
@@ -61,7 +61,7 @@ Docker initializes:
 - `wager-transactions-dlq.fifo`
 - `wager-events.fifo`
 
-The BET consumer expects this versioned provider message contract:
+The consumer expects this versioned provider message contract. `kind` accepts `BET`, `WIN`, `LOSS`, `REFUND`, or `ROLLBACK`; `REFUND` and `ROLLBACK` require `referenceExternalTransactionId`, while `WIN` can optionally reference the BET of the same round. `OPENING` is internal-only.
 
 ```json
 {
@@ -76,7 +76,7 @@ The BET consumer expects this versioned provider message contract:
     "walletId": "00000000-0000-0000-0000-000000000002",
     "roundId": "round-987",
     "gameId": "fortune-chimp",
-    "kind": "BET",
+        "kind": "BET",
     "money": {
       "amount": "25.00",
       "currency": "BRL"
@@ -104,13 +104,27 @@ Published events use this envelope:
 
 Outbox delivery is at-least-once. Downstream consumers must persistently deduplicate by `eventId`.
 
+## HTTP API
+
+- `POST /wallets`
+- `GET /wallets/:walletId`
+- `GET /wallets/:walletId/ledger?cursor=&limit=50`
+- `POST /wagering/transactions` with mandatory `Idempotency-Key`
+- `GET /wagering/transactions/:transactionId`
+- `GET /providers/:providerId/wagering/transactions/:externalTransactionId`
+- `POST /wallets/:walletId/reconciliation`
+- `GET /health/live`, `GET /health/ready`, and `GET /metrics`
+
 ## Reliability model
 
 - Inbox registration, wallet mutation, wager transaction, ledger entry, and outbox events commit in one PostgreSQL transaction.
 - SQS messages are acknowledged only after that transaction commits.
 - Deterministic contract/domain failures are terminal and acknowledged; infrastructure or unexpected failures remain available for retry and eventual DLQ delivery.
 - Outbox events are published only after the financial transaction commits.
+- REFUND and ROLLBACK received before their reference are persisted as `PENDING_REFERENCE`; a durable worker retries with backoff and finally rejects them as `REFERENCE_NOT_FOUND`.
+- A referenced WIN also waits for a missing or pending BET. The pending-reference worker uses ten attempts with exponential backoff capped at five minutes.
 - A publisher crash after sending but before recording `published_at` can cause redelivery, so exactly-once SQS delivery is not claimed.
+- `GET /metrics` derives durable transaction, duplicate, retry, latency, outbox-lag, DLQ-depth, and PostgreSQL-deadlock metrics from PostgreSQL and SQS; it does not depend on a worker process's memory.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full concurrency and delivery design.
 

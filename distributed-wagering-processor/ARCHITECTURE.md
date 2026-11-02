@@ -2,9 +2,9 @@
 
 ## Current milestone
 
-The current milestone implements the framework-free `Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction`, `InboxMessage`, `OutboxMessage`, and integration-event models together with `CreateWalletUseCase` and `ProcessBetUseCase`. Wallet creation and BET processing persist through PostgreSQL transactions; BET processing combines a wallet-scoped `SELECT ... FOR UPDATE`, persistent idempotency, and the immutable wallet ledger. SQS BET delivery now uses a persistent inbox, and committed BET outcomes are recorded in the transactional outbox.
+The service implements the framework-free `Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction`, `InboxMessage`, `OutboxMessage`, and integration-event models. `ProcessWagerTransactionUseCase` handles BET, WIN, LOSS, REFUND, and ROLLBACK in PostgreSQL transactions. Wallet creation and financial processing combine a wallet-scoped `SELECT ... FOR UPDATE`, persistent idempotency, and the immutable wallet ledger.
 
-WIN, LOSS, REFUND, ROLLBACK, pending-reference processing, HTTP wager endpoints, authentication, metrics, and readiness checks remain deferred.
+REFUND and ROLLBACK with a missing reference are durably persisted as `PENDING_REFERENCE`. A WIN may optionally reference a BET; when supplied, it is validated against the same provider, player, wallet, currency, and round. A dependent operation also remains pending while its referenced operation is pending. A separate worker claims due rows with `SKIP LOCKED`, retries ten times with exponential backoff capped at five minutes, and turns exhausted rows into an auditable `REFERENCE_NOT_FOUND` rejection.
 
 ## Shape
 
@@ -33,18 +33,24 @@ The MikroORM configuration intentionally uses `migrationsList` so TypeScript mig
 
 ## Messaging
 
-LocalStack provides the wager FIFO queue, its dead-letter queue, and the integration-event FIFO queue for local development. The SQS consumer uses the provider's body-level `messageId`—not the transport-level SQS `MessageId`—as the `(consumer_name, message_id)` inbox identity. It invokes the shared `ProcessBetUseCase`, marks the inbox row processed, and writes transaction, wallet, ledger, and outbox state in one PostgreSQL transaction. A duplicate provider message ID therefore cannot repeat the financial effect.
+LocalStack provides the wager FIFO queue, its dead-letter queue, and the integration-event FIFO queue for local development. The SQS consumer uses the provider's body-level `messageId`—not the transport-level SQS `MessageId`—as the `(consumer_name, message_id)` inbox identity. It invokes the shared `ProcessWagerTransactionUseCase`, marks the inbox row processed, and writes transaction, wallet, ledger, and outbox state in one PostgreSQL transaction. A duplicate provider message ID therefore cannot repeat the financial effect.
 
 Malformed contracts and deterministic domain/application failures are terminal. Valid messages that reach such a failure persist their processed inbox outcome before SQS acknowledgment; malformed messages are acknowledged without financial processing. PostgreSQL, SQS, network, timeout, and unexpected failures remain transient: they escape the consumer without acknowledgment so SQS can retry and eventually apply its DLQ policy.
 
 The outbox publisher claims eligible rows with `FOR UPDATE SKIP LOCKED` and persists a worker identity plus an expiring lease. Multiple publishers can work concurrently without claiming the same row. A confirmed SQS send is followed by `published_at`; failed sends increment `attempts`, store the error, and schedule bounded exponential backoff. Rows that reach the configured attempt limit enter a terminal `failed_at` state instead of looping forever.
 
-Every published event uses the versioned `eventId`, `eventType`, `aggregateId`, `correlationId`, optional `causationId`, `occurredAt`, `version`, and `data` envelope. Current BET events use the wager transaction ID as their stable correlation ID and the BET idempotency key as causation ID. Monetary event data contains serialized `MoneyProps`, never domain `Money` objects.
+Every published event uses the versioned `eventId`, `eventType`, `aggregateId`, `correlationId`, optional `causationId`, `occurredAt`, `version`, and `data` envelope. Wager events use the wager transaction ID as their stable correlation ID and the wager idempotency key as causation ID. Monetary event data contains serialized `MoneyProps`, never domain `Money` objects.
 
 Publication is at-least-once, not exactly-once. A publisher can die after SQS accepts an event but before PostgreSQL records `published_at`; after the lease expires another publisher may send that event again. Every downstream consumer must persistently deduplicate by `eventId`, which is also the FIFO `MessageDeduplicationId`.
 
 FIFO ordering helps reduce avoidable contention and out-of-order delivery, but it is not the financial source of truth. Correctness still holds for retries, duplicate delivery, multiple consumers, and direct concurrent calls because PostgreSQL row locks, constraints, the inbox, persisted BET idempotency, and the immutable ledger remain authoritative.
 
+## Reconciliation and observability
+
+Reconciliation acquires a PostgreSQL shared lock on the wallet row before reading its ledger, so a writer cannot commit a balance movement between the two reads. A divergence is returned to the caller, emitted as a structured log, and counted in `wallet_reconciliation_mismatches_total`; it is never corrected automatically.
+
+The HTTP metrics endpoint derives cross-process values from durable PostgreSQL state and SQS: wagers by status, inbox duplicates, outbox and pending-reference retries, outbox lag, processing latency, visible DLQ messages, and PostgreSQL deadlocks. Process-local counters remain useful for short-lived request diagnostics but are not the source of worker metrics.
+
 ## Authentication
 
-Authentication is intentionally not implemented in this milestone. A future HTTP adapter will receive provider identity from an external OIDC IdP/guard, while health endpoints remain unauthenticated. No local password store will be introduced.
+Authentication is intentionally not implemented. `ProviderIdentityPort` is the explicit code-level extension point for an external OIDC IdP/guard; health endpoints remain unauthenticated. No local password store is introduced.

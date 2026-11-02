@@ -29,7 +29,7 @@ describe('WagerTransactionRequested contract', () => {
       payload: requiredBody.data,
     }))).toThrow(InvalidWagerMessageError);
     expect(() => parseWagerTransactionRequested(JSON.stringify({
-      ...requiredBody, data: { ...requiredBody.data, kind: 'WIN' },
+      ...requiredBody, data: { ...requiredBody.data, kind: 'UNKNOWN' },
     }))).toThrow(InvalidWagerMessageError);
   });
 });

@@ -17,6 +17,7 @@ import type {
 import type { IntegrationEvent } from '../../../messaging/domain/integration-event.js';
 import {
   WagerTransaction,
+  type WagerTransactionKind,
   type WagerTransactionStatus,
 } from '../../domain/wager-transaction.js';
 
@@ -40,6 +41,9 @@ interface WagerTransactionRow {
   player_id: string;
   round_id: string;
   game_id: string;
+  kind: WagerTransactionKind;
+  reference_external_transaction_id: string | null;
+  reference_transaction_id: string | null;
   amount: string;
   currency: string;
   status: WagerTransactionStatus;
@@ -114,10 +118,10 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
   async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | null> {
     const rows = await this.entityManager.execute<WagerTransactionRow[]>(
       `select "id", "provider_id", "external_transaction_id", "idempotency_key", "payload_hash",
-              "wallet_id", "player_id", "round_id", "game_id", "amount", "currency", "status",
+              "wallet_id", "player_id", "round_id", "game_id", "kind", "reference_external_transaction_id", "reference_transaction_id", "amount", "currency", "status",
               "failure_code", "result_balance_amount", "processed_at", "created_at"
          from "wager_transactions"
-        where "idempotency_key" = ? and "kind" = 'BET'`,
+        where "idempotency_key" = ?`,
       [idempotencyKey],
     );
     return this.rehydrate(rows[0]);
@@ -129,10 +133,10 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
   ): Promise<WagerTransaction | null> {
     const rows = await this.entityManager.execute<WagerTransactionRow[]>(
       `select "id", "provider_id", "external_transaction_id", "idempotency_key", "payload_hash",
-              "wallet_id", "player_id", "round_id", "game_id", "amount", "currency", "status",
+              "wallet_id", "player_id", "round_id", "game_id", "kind", "reference_external_transaction_id", "reference_transaction_id", "amount", "currency", "status",
               "failure_code", "result_balance_amount", "processed_at", "created_at"
          from "wager_transactions"
-        where "provider_id" = ? and "external_transaction_id" = ? and "kind" = 'BET'`,
+        where "provider_id" = ? and "external_transaction_id" = ?`,
       [providerId, externalTransactionId],
     );
     return this.rehydrate(rows[0]);
@@ -153,7 +157,10 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
       playerId: row.player_id,
       roundId: row.round_id,
       gameId: row.game_id,
+      kind: row.kind,
       money: Money.from({ amount: row.amount, currency: row.currency }),
+      referenceExternalTransactionId: row.reference_external_transaction_id ?? undefined,
+      referenceTransactionId: row.reference_transaction_id,
       status: row.status,
       resultBalance: row.result_balance_amount === null
         ? null
@@ -170,8 +177,8 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
         `insert into "wager_transactions"
           ("id", "provider_id", "external_transaction_id", "idempotency_key", "payload_hash",
            "wallet_id", "player_id", "round_id", "game_id", "kind", "amount", "currency",
-           "status", "failure_code", "result_balance_amount", "processed_at", "created_at")
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'BET', ?, ?, ?, ?, ?, ?, ?)`,
+           "reference_external_transaction_id", "reference_transaction_id", "status", "failure_code", "result_balance_amount", "processed_at", "created_at")
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           transaction.id,
           transaction.providerId,
@@ -182,8 +189,11 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
           transaction.playerId,
           transaction.roundId,
           transaction.gameId,
+          transaction.kind,
           transaction.money.toString(),
           transaction.money.currency,
+          transaction.referenceExternalTransactionId,
+          transaction.referenceTransactionId,
           transaction.status,
           transaction.failureCode,
           transaction.resultBalance?.toString() ?? null,
@@ -195,6 +205,36 @@ class MikroOrmBetTransactionRepository implements BetTransactionRepository {
     } catch (error) {
       throw mapUniqueConstraint(error);
     }
+  }
+
+  async findByReferenceAndKind(referenceTransactionId: string, kind: string): Promise<WagerTransaction | null> {
+    const rows = await this.entityManager.execute<WagerTransactionRow[]>(
+      `select "id", "provider_id", "external_transaction_id", "idempotency_key", "payload_hash",
+              "wallet_id", "player_id", "round_id", "game_id", "kind", "reference_external_transaction_id", "reference_transaction_id", "amount", "currency", "status",
+              "failure_code", "result_balance_amount", "processed_at", "created_at"
+         from "wager_transactions" where "reference_transaction_id" = ? and "kind" = ?`,
+      [referenceTransactionId, kind],
+    );
+    return this.rehydrate(rows[0]);
+  }
+
+  async findByIdForUpdate(id: string): Promise<WagerTransaction | null> {
+    const rows = await this.entityManager.execute<WagerTransactionRow[]>(
+      `select "id", "provider_id", "external_transaction_id", "idempotency_key", "payload_hash",
+              "wallet_id", "player_id", "round_id", "game_id", "kind", "reference_external_transaction_id", "reference_transaction_id", "amount", "currency", "status",
+              "failure_code", "result_balance_amount", "processed_at", "created_at"
+         from "wager_transactions" where "id" = ? for update`, [id],
+    );
+    return this.rehydrate(rows[0]);
+  }
+
+  async update(transaction: WagerTransaction): Promise<void> {
+    await this.entityManager.execute(
+      `update "wager_transactions" set "status" = ?, "reference_transaction_id" = ?, "failure_code" = ?,
+       "result_balance_amount" = ?, "processed_at" = ? where "id" = ?`,
+      [transaction.status, transaction.referenceTransactionId, transaction.failureCode,
+        transaction.resultBalance?.toString() ?? null, transaction.processedAt, transaction.id], 'run',
+    );
   }
 }
 

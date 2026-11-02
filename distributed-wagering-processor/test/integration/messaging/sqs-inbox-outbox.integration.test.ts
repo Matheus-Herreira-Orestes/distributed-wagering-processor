@@ -3,15 +3,19 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import {
   CreateQueueCommand,
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
+  SetQueueAttributesCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';
 import config from '../../../mikro-orm.config.js';
 import { Money } from '../../../src/shared/domain/money.js';
 import { CreateWalletUseCase } from '../../../src/wallets/application/create-wallet.use-case.js';
 import { MikroOrmCreateWalletUnitOfWork } from '../../../src/wallets/infrastructure/persistence/mikro-orm-create-wallet.unit-of-work.js';
-import { ProcessBetUseCase } from '../../../src/wagering/application/process-bet.use-case.js';
+import { ProcessWagerTransactionUseCase } from '../../../src/wagering/application/process-wager-transaction.use-case.js';
+import { WagerTransactionKind, WagerTransactionStatus } from '../../../src/wagering/domain/wager-transaction.js';
+import { PendingReferenceWorker } from '../../../src/wagering/infrastructure/persistence/pending-reference-worker.js';
 import { MikroOrmProcessBetUnitOfWork } from '../../../src/wagering/infrastructure/persistence/mikro-orm-process-bet.unit-of-work.js';
 import {
   ProcessWagerMessageUseCase,
@@ -21,6 +25,7 @@ import { MikroOrmWagerMessageUnitOfWork } from '../../../src/messaging/infrastru
 import { MikroOrmOutboxStore } from '../../../src/messaging/infrastructure/persistence/mikro-orm-outbox-store.js';
 import { SqsWagerConsumer } from '../../../src/messaging/infrastructure/sqs/sqs-wager-consumer.js';
 import { SqsOutboxPublisher } from '../../../src/messaging/infrastructure/sqs/sqs-outbox-publisher.js';
+import { RuntimeService } from '../../../src/interfaces/runtime.service.js';
 
 interface CountRow { count: string; }
 interface WalletRow { balance_amount: string; version: number; }
@@ -47,22 +52,25 @@ interface PublishedEvent {
 describe('SQS inbox and transactional outbox with PostgreSQL and LocalStack', () => {
   let orm: MikroORM;
   let secondaryOrm: MikroORM;
+  let tertiaryOrm: MikroORM;
   let sqs: SQSClient;
   let wagerQueueUrl: string;
   let eventQueueUrl: string;
   let createWallet: CreateWalletUseCase;
+  let processWager: ProcessWagerTransactionUseCase;
   let messageProcessor: ProcessWagerMessageUseCase;
   let consumer: SqsWagerConsumer;
 
   beforeAll(async () => {
     orm = await MikroORM.init(config);
     secondaryOrm = await MikroORM.init(config);
+    tertiaryOrm = await MikroORM.init(config);
     await orm.getMigrator().up();
     createWallet = new CreateWalletUseCase(new MikroOrmCreateWalletUnitOfWork(orm));
-    const processBet = new ProcessBetUseCase(new MikroOrmProcessBetUnitOfWork(orm));
+    processWager = new ProcessWagerTransactionUseCase(new MikroOrmProcessBetUnitOfWork(orm));
     messageProcessor = new ProcessWagerMessageUseCase(
       new MikroOrmWagerMessageUnitOfWork(orm),
-      processBet,
+      processWager,
     );
 
     sqs = new SQSClient({
@@ -77,7 +85,7 @@ describe('SQS inbox and transactional outbox with PostgreSQL and LocalStack', ()
 
   afterAll(async () => {
     sqs?.destroy();
-    await Promise.all([orm?.close(true), secondaryOrm?.close(true)]);
+    await Promise.all([orm?.close(true), secondaryOrm?.close(true), tertiaryOrm?.close(true)]);
   });
 
   test('an SQS BET creates one inbox record and one financial effect atomically', async () => {
@@ -114,6 +122,25 @@ describe('SQS inbox and transactional outbox with PostgreSQL and LocalStack', ()
     expect(await betCount(wallet.id)).toBe(1);
     expect(await ledgerCount(wallet.id)).toBe(1);
     expect(await count('inbox_messages', 'message_id', providerMessageId)).toBe(1);
+  });
+
+  test('reprocesses a REFUND after its BET arrives out of order', async () => {
+    const wallet = await openWallet('100.00');
+    const suffix = crypto.randomUUID();
+    const pending = await processWager.execute({
+      providerId: 'pending-provider', externalTransactionId: `refund-${suffix}`, idempotencyKey: `refund-key-${suffix}`,
+      playerId: wallet.playerId, walletId: wallet.id, roundId: `round-${suffix}`, gameId: 'game-1',
+      kind: WagerTransactionKind.REFUND, referenceExternalTransactionId: `bet-${suffix}`,
+      money: Money.from({ amount: '10.00', currency: 'BRL' }),
+    });
+    expect(pending.status).toBe(WagerTransactionStatus.PENDING_REFERENCE);
+    await processWager.execute({
+      providerId: 'pending-provider', externalTransactionId: `bet-${suffix}`, idempotencyKey: `bet-key-${suffix}`,
+      playerId: wallet.playerId, walletId: wallet.id, roundId: `round-${suffix}`, gameId: 'game-1',
+      kind: WagerTransactionKind.BET, money: Money.from({ amount: '10.00', currency: 'BRL' }),
+    });
+    await new PendingReferenceWorker(orm, processWager).runOnce();
+    expect(await walletState(wallet.id)).toEqual({ balance_amount: '100.00', version: 3 });
   });
 
   test('a database failure rolls back inbox, wallet, transaction, ledger, and outbox together', async () => {
@@ -283,12 +310,146 @@ describe('SQS inbox and transactional outbox with PostgreSQL and LocalStack', ()
     expect(await walletState(wallet.id)).toEqual({ balance_amount: '100.00', version: 1 });
   });
 
-  async function ensureQueue(name: string): Promise<string> {
+  test('the generic use case keeps one debit when the same BET races across ORM instances', async () => {
+    const wallet = await openWallet('100.00');
+    const suffix = crypto.randomUUID();
+    const input = {
+      providerId: 'generic-race-provider', externalTransactionId: `bet-${suffix}`, idempotencyKey: `key-${suffix}`,
+      playerId: wallet.playerId, walletId: wallet.id, roundId: `round-${suffix}`, gameId: 'game-1',
+      kind: WagerTransactionKind.BET, money: Money.from({ amount: '80.00', currency: 'BRL' }),
+    };
+    const secondaryProcessor = new ProcessWagerTransactionUseCase(new MikroOrmProcessBetUnitOfWork(secondaryOrm));
+    const tertiaryProcessor = new ProcessWagerTransactionUseCase(new MikroOrmProcessBetUnitOfWork(tertiaryOrm));
+    const processors = [processWager, secondaryProcessor, tertiaryProcessor];
+    const results = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      processors[index % processors.length]!.execute(input),
+    ));
+    expect(results.filter(result => !result.idempotentReplay)).toHaveLength(1);
+    expect(await walletState(wallet.id)).toEqual({ balance_amount: '20.00', version: 2 });
+    expect(await betCount(wallet.id)).toBe(1);
+    expect(await ledgerCount(wallet.id)).toBe(1);
+  });
+
+  test('keeps ledger reconciliation consistent while three generic instances write concurrently', async () => {
+    const wallet = await openWallet('100.00');
+    const processors = [
+      processWager,
+      new ProcessWagerTransactionUseCase(new MikroOrmProcessBetUnitOfWork(secondaryOrm)),
+      new ProcessWagerTransactionUseCase(new MikroOrmProcessBetUnitOfWork(tertiaryOrm)),
+    ];
+    const inputs = ['10.00', '20.00', '30.00'].map((amount, index) => ({
+      providerId: 'generic-reconciliation-provider', externalTransactionId: `bet-${crypto.randomUUID()}`,
+      idempotencyKey: `key-${crypto.randomUUID()}`, playerId: wallet.playerId, walletId: wallet.id,
+      roundId: `round-${index}`, gameId: 'game-1', kind: WagerTransactionKind.BET,
+      money: Money.from({ amount, currency: 'BRL' }),
+    }));
+    const runtime = new RuntimeService();
+    try {
+      const concurrent = await Promise.all([
+        ...inputs.map((input, index) => processors[index]!.execute(input)),
+        ...Array.from({ length: 3 }, () => runtime.reconcile(wallet.id)),
+      ]);
+      const reconciliations = concurrent.slice(inputs.length) as Array<Record<string, unknown> | null>;
+
+      expect(concurrent.slice(0, inputs.length).every(result => (result as { status: string }).status === 'PROCESSED')).toBe(true);
+      expect(reconciliations.every(result => result?.consistent === true)).toBe(true);
+      expect(await walletState(wallet.id)).toEqual({ balance_amount: '40.00', version: 4 });
+      expect(await betCount(wallet.id)).toBe(3);
+      expect(await ledgerCount(wallet.id)).toBe(3);
+      expect((await runtime.reconcile(wallet.id))?.consistent).toBe(true);
+    } finally {
+      await runtime.onModuleDestroy();
+    }
+  });
+
+  test('expires an unresolved reference with an auditable rejection event', async () => {
+    const wallet = await openWallet('100.00');
+    const suffix = crypto.randomUUID();
+    const pending = await processWager.execute({
+      providerId: 'expiry-provider', externalTransactionId: `refund-${suffix}`, idempotencyKey: `refund-key-${suffix}`,
+      playerId: wallet.playerId, walletId: wallet.id, roundId: `round-${suffix}`, gameId: 'game-1',
+      kind: WagerTransactionKind.REFUND, referenceExternalTransactionId: `missing-${suffix}`,
+      money: Money.from({ amount: '10.00', currency: 'BRL' }),
+    });
+    await new PendingReferenceWorker(orm, processWager, 1).runOnce();
+    const state = (await query<{ status: string; failure_code: string | null }>(
+      'select status, failure_code from wager_transactions where id = ?', [pending.transactionId],
+    ))[0];
+    expect(state).toEqual({ status: 'REJECTED', failure_code: 'REFERENCE_NOT_FOUND' });
+    expect((await outboxTypes(wallet.id)).map(row => row.event_type)).toContain('WagerTransactionRejected');
+  });
+
+  test('redelivery after a commit before ACK does not duplicate the financial effect', async () => {
+    const wallet = await openWallet('100.00');
+    const body = requestBody(wallet, '25.00');
+    const providerMessageId = providerIdFrom(body);
+    const transportMessageId = await sendBet(body);
+    const received = await receiveMessageById(transportMessageId);
+
+    // Simulates a worker dying immediately after its database commit and before DeleteMessage.
+    await messageProcessor.execute(received.Body!);
+    await Bun.sleep(1_100);
+    const redelivery = await receiveMessageById(transportMessageId);
+    expect(await consumer.handle(redelivery)).toBe(true);
+
+    expect(await walletState(wallet.id)).toEqual({ balance_amount: '75.00', version: 2 });
+    expect(await betCount(wallet.id)).toBe(1);
+    expect(await ledgerCount(wallet.id)).toBe(1);
+    expect(await count('inbox_messages', 'message_id', providerMessageId)).toBe(1);
+  });
+
+  test('moves an unacknowledged transient failure to the configured DLQ', async () => {
+    const suffix = crypto.randomUUID();
+    const dlqUrl = await ensureQueue(`wager-test-dlq-${suffix}.fifo`);
+    const dlqAttributes = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: dlqUrl, AttributeNames: ['QueueArn'] }));
+    const sourceUrl = await ensureQueue(`wager-test-source-${suffix}.fifo`, {
+      RedrivePolicy: JSON.stringify({ deadLetterTargetArn: dlqAttributes.Attributes?.QueueArn, maxReceiveCount: '1' }),
+    });
+    const dlqConsumer = new SqsWagerConsumer(sqs, sourceUrl, messageProcessor, 1, dlqUrl);
+    const wallet = await openWallet('100.00');
+    const functionName = `dlq_failure_${wallet.id.replaceAll('-', '_')}`;
+    await query(`create function ${functionName}() returns trigger language plpgsql as $$
+      begin raise exception 'forced transient failure'; end; $$`);
+    await query(`create trigger ${functionName} before insert on outbox_messages
+      for each row when (new.aggregate_id = '${wallet.id}') execute function ${functionName}()`);
+    try {
+      const response = await sqs.send(new SendMessageCommand({
+        QueueUrl: sourceUrl, MessageBody: requestBody(wallet, '10.00'),
+        MessageGroupId: 'group', MessageDeduplicationId: crypto.randomUUID(),
+      }));
+      if (response.MessageId === undefined) throw new Error('SQS did not return a message ID.');
+      const message = await receiveMessageByIdFrom(sourceUrl, response.MessageId);
+      await expect(dlqConsumer.handle(message)).rejects.toThrow('forced transient failure');
+      let movedToDlq = false;
+      for (let attempt = 0; attempt < 6 && !movedToDlq; attempt += 1) {
+        await Bun.sleep(1_100);
+        try {
+          await dlqConsumer.pollOnce(1);
+        } catch (error) {
+          expect(error).toBeInstanceOf(Error);
+        }
+        const dlqResponse = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, MaxNumberOfMessages: 1, WaitTimeSeconds: 0 }));
+        movedToDlq = (dlqResponse.Messages?.length ?? 0) === 1;
+      }
+      expect(movedToDlq).toBe(true);
+    } finally {
+      await query(`drop trigger ${functionName} on outbox_messages`);
+      await query(`drop function ${functionName}()`);
+    }
+  });
+
+  async function ensureQueue(name: string, attributes: Record<string, string> = {}): Promise<string> {
     const response = await sqs.send(new CreateQueueCommand({
       QueueName: name,
-      Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+      Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false', ...attributes },
     }));
     if (response.QueueUrl === undefined) throw new Error(`Queue ${name} has no URL.`);
+    if (attributes.RedrivePolicy !== undefined) {
+      await sqs.send(new SetQueueAttributesCommand({
+        QueueUrl: response.QueueUrl,
+        Attributes: { RedrivePolicy: attributes.RedrivePolicy },
+      }));
+    }
     return response.QueueUrl;
   }
 
@@ -343,9 +504,13 @@ describe('SQS inbox and transactional outbox with PostgreSQL and LocalStack', ()
   }
 
   async function receiveMessageById(messageId: string) {
+    return receiveMessageByIdFrom(wagerQueueUrl, messageId);
+  }
+
+  async function receiveMessageByIdFrom(queueUrl: string, messageId: string) {
     for (let attempt = 0; attempt < 30; attempt += 1) {
       const response = await sqs.send(new ReceiveMessageCommand({
-        QueueUrl: wagerQueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 0,
+        QueueUrl: queueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 0,
         VisibilityTimeout: 1, MessageSystemAttributeNames: ['ApproximateReceiveCount'],
       }));
       const found = response.Messages?.find(message => message.MessageId === messageId);

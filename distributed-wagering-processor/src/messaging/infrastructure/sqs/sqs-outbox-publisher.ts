@@ -1,5 +1,6 @@
 import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import type { OutboxStore } from '../../application/ports/outbox-store.port.js';
+import { log, metrics } from '../../../observability.js';
 
 export interface OutboxPublisherOptions {
   workerId: string;
@@ -54,6 +55,10 @@ export class SqsOutboxPublisher {
           MessageDeduplicationId: message.payload.eventId,
         }));
         await this.store.markPublished(message.id, this.options.workerId, new Date());
+        metrics.increment('outbox_events_published_total', { eventType: message.eventType });
+        metrics.set('outbox_event_lag_ms', Date.now() - message.occurredAt.getTime(), { eventType: message.eventType });
+        log('outbox_event_published', { eventId: message.id, aggregateId: message.aggregateId, eventType: message.eventType,
+          outboxLagMs: Date.now() - message.occurredAt.getTime() });
         published += 1;
       } catch (error) {
         await this.store.recordFailure({
@@ -65,6 +70,7 @@ export class SqsOutboxPublisher {
           maxDelayMs: this.maxDelayMs,
           maxAttempts: this.maxAttempts,
         });
+        metrics.increment('outbox_publish_retries_total', { eventType: message.eventType });
         failed += 1;
       }
     }

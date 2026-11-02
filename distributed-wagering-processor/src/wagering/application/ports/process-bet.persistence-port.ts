@@ -14,7 +14,10 @@ export interface BetTransactionRepository {
     providerId: string,
     externalTransactionId: string,
   ): Promise<WagerTransaction | null>;
+  findByReferenceAndKind?(referenceTransactionId: string, kind: string): Promise<WagerTransaction | null>;
+  findByIdForUpdate?(id: string): Promise<WagerTransaction | null>;
   insert(transaction: WagerTransaction): Promise<void>;
+  update?(transaction: WagerTransaction): Promise<void>;
 }
 
 export interface BetLedgerRepository {

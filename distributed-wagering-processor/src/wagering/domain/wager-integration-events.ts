@@ -12,6 +12,7 @@ export interface WagerTransactionProcessedData {
   readonly externalTransactionId: string;
   readonly money: MoneyProps;
   readonly resultBalance: MoneyProps;
+  readonly kind?: string;
 }
 
 export interface WagerTransactionRejectedData extends WagerTransactionProcessedData {
@@ -47,4 +48,20 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
   readonly version = 1;
 
   constructor(props: IntegrationEventProps<WalletBalanceChangedData>) { super(props); }
+}
+
+export interface WagerTransactionPendingReferenceData {
+  readonly transactionId: string;
+  readonly walletId: string;
+  readonly providerId: string;
+  readonly externalTransactionId: string;
+  readonly referenceExternalTransactionId: string;
+  readonly kind: 'WIN' | 'REFUND' | 'ROLLBACK';
+}
+
+export class WagerTransactionPendingReference extends IntegrationEvent<WagerTransactionPendingReferenceData> {
+  readonly eventType = 'WagerTransactionPendingReference';
+  readonly version = 1;
+
+  constructor(props: IntegrationEventProps<WagerTransactionPendingReferenceData>) { super(props); }
 }

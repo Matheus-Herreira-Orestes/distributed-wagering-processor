@@ -59,6 +59,19 @@ describe('WagerTransaction BET', () => {
     expect(transaction.resultBalance?.toString()).toBe('10.00');
   });
 
+  test('transitions a pending transaction to FAILED with an auditable code', () => {
+    const transaction = WagerTransaction.createBet(props());
+    transaction.fail(
+      WagerFailureCode.REFERENCE_PROCESSING_FAILED,
+      Money.from({ amount: '10.00', currency: 'BRL' }),
+      createdAt,
+    );
+
+    expect(transaction.status).toBe(WagerTransactionStatus.FAILED);
+    expect(transaction.failureCode).toBe('REFERENCE_PROCESSING_FAILED');
+    expect(transaction.isTerminal).toBe(true);
+  });
+
   test('does not allow a terminal transaction to transition again', () => {
     const transaction = WagerTransaction.createBet(props());
     transaction.markProcessed(Money.from({ amount: '75.00', currency: 'BRL' }), createdAt);
@@ -70,10 +83,12 @@ describe('WagerTransaction BET', () => {
     )).toThrow(TerminalWagerTransactionError);
   });
 
-  test('rejects invalid hashes, negative amounts, and result currency mismatches', () => {
+  test('rejects invalid hashes, non-positive amounts, and result currency mismatches', () => {
     expect(() => WagerTransaction.createBet(props({ payloadHash: 'not-a-hash' })))
       .toThrow(InvalidWagerTransactionError);
     expect(() => WagerTransaction.createBet(props({ money: Money.from({ amount: '1.00', currency: 'BRL' }).negate() })))
+      .toThrow(InvalidWagerTransactionError);
+    expect(() => WagerTransaction.createBet(props({ money: Money.zero('BRL') })))
       .toThrow(InvalidWagerTransactionError);
 
     const transaction = WagerTransaction.createBet(props());

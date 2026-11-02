@@ -2,6 +2,8 @@ import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
 import { Migration20261031000000_initial_schema } from './migrations/Migration20261031000000_initial_schema.js';
 import { Migration20261101000000_outbox_claiming } from './migrations/Migration20261101000000_outbox_claiming.js';
+import { Migration20261102000000_pending_reference_retry } from './migrations/Migration20261102000000_pending_reference_retry.js';
+import { Migration20261103000000_observability } from './migrations/Migration20261103000000_observability.js';
 
 export default defineConfig({
   clientUrl: process.env.DATABASE_URL
@@ -15,6 +17,8 @@ export default defineConfig({
     migrationsList: [
       Migration20261031000000_initial_schema,
       Migration20261101000000_outbox_claiming,
+      Migration20261102000000_pending_reference_retry,
+      Migration20261103000000_observability,
     ],
     transactional: true,
     allOrNothing: true,

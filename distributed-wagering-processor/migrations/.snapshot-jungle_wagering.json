@@ -85,6 +85,22 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "duplicate_count": {
+          "name": "duplicate_count",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
         }
       },
       "name": "inbox_messages",
@@ -102,7 +118,14 @@
           "primary": true
         }
       ],
-      "checks": [],
+      "checks": [
+        {
+          "name": "inbox_messages_duplicate_count_check",
+          "columnName": "duplicate_count",
+          "definition": "CHECK ((duplicate_count >= 0))",
+          "expression": "duplicate_count >= 0"
+        }
+      ],
       "foreignKeys": {},
       "nativeEnums": {},
       "comment": null
@@ -353,7 +376,7 @@
         },
         {
           "name": "outbox_messages_claim_consistency",
-          "columnName": "claim_expires_at",
+          "columnName": "claimed_at",
           "definition": "CHECK ((((claimed_at IS NULL) AND (claimed_by IS NULL) AND (claim_expires_at IS NULL)) OR ((claimed_at IS NOT NULL) AND (claimed_by IS NOT NULL) AND (claim_expires_at IS NOT NULL))))",
           "expression": "((claimed_at IS NULL) AND (claimed_by IS NULL) AND (claim_expires_at IS NULL)) OR ((claimed_at IS NOT NULL) AND (claimed_by IS NOT NULL) AND (claim_expires_at IS NOT NULL))"
         }
@@ -680,6 +703,38 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "reference_attempts": {
+          "name": "reference_attempts",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "next_reference_attempt_at": {
+          "name": "next_reference_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
         }
       },
       "name": "wager_transactions",
@@ -706,6 +761,18 @@
           "unique": false,
           "primary": false,
           "expression": "CREATE INDEX wager_transactions_pending_reference_idx ON public.wager_transactions USING btree (status, created_at) WHERE ((status)::text = 'PENDING_REFERENCE'::text)"
+        },
+        {
+          "columnNames": [
+            "next_reference_attempt_at",
+            "created_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wager_transactions_pending_reference_retry_idx",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX wager_transactions_pending_reference_retry_idx ON public.wager_transactions USING btree (next_reference_attempt_at, created_at) WHERE ((status)::text = 'PENDING_REFERENCE'::text)"
         },
         {
           "columnNames": [
@@ -741,6 +808,12 @@
           "columnName": "currency",
           "definition": "CHECK ((currency ~ '^[A-Z]{3}$'::text))",
           "expression": "currency ~ '^[A-Z]{3}$'::text"
+        },
+        {
+          "name": "wager_transactions_reference_attempts_check",
+          "columnName": "reference_attempts",
+          "definition": "CHECK ((reference_attempts >= 0))",
+          "expression": "reference_attempts >= 0"
         },
         {
           "name": "wager_transactions_result_balance_amount_check",
@@ -976,7 +1049,7 @@
         },
         {
           "name": "wallet_ledger_entries_arithmetic_check",
-          "columnName": "direction",
+          "columnName": "balance_after",
           "definition": "CHECK (((((direction)::text = 'CREDIT'::text) AND (balance_after = (balance_before + amount))) OR (((direction)::text = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))))",
           "expression": "((direction = 'CREDIT'::text) AND balance_after = (balance_before + amount))) OR (((direction = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))"
         },

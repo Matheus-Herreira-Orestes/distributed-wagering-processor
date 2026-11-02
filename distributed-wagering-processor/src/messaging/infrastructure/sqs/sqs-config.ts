@@ -4,6 +4,7 @@ export interface SqsConfig {
   endpoint: string;
   region: string;
   wagerQueueUrl: string;
+  wagerDlqQueueUrl: string;
   eventQueueUrl: string;
   wagerVisibilityTimeoutSeconds: number;
 }
@@ -25,6 +26,8 @@ export function sqsConfigFromEnvironment(environment: SqsEnvironment = process.e
     region,
     wagerQueueUrl: environment.WAGER_QUEUE_URL
       ?? `${endpoint}/000000000000/wager-transactions.fifo`,
+    wagerDlqQueueUrl: environment.WAGER_DLQ_QUEUE_URL
+      ?? `${endpoint}/000000000000/wager-transactions-dlq.fifo`,
     eventQueueUrl: environment.WAGER_EVENT_QUEUE_URL
       ?? `${endpoint}/000000000000/wager-events.fifo`,
     wagerVisibilityTimeoutSeconds: parseVisibilityTimeout(

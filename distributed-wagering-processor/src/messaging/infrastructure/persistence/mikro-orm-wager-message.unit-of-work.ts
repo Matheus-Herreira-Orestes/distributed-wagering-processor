@@ -45,6 +45,12 @@ class MikroOrmInboxRepository implements InboxRepository {
         `Inbox identity ${message.consumerName}/${message.messageId} has a different payload.`,
       );
     }
+    await this.entityManager.execute(
+      `update "inbox_messages" set "duplicate_count" = "duplicate_count" + 1
+        where "consumer_name" = ? and "message_id" = ?`,
+      [message.consumerName, message.messageId],
+      'run',
+    );
     return false;
   }
 
